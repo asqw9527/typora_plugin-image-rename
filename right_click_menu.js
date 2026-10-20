@@ -1,0 +1,300 @@
+const LEVEL = { SECOND: 0, THIRD: 1 }
+
+const createMenuManager = () => {
+  // The opened submenu chain, shallow to deep:
+  //   chain[LEVEL.SECOND] = { menu: .plugin-menu-2nd ul, trigger: #context-menu li }
+  //   chain[LEVEL.THIRD]  = { menu: .plugin-menu-3rd ul,  trigger: .plugin-menu-2nd li }
+  const chain = []
+
+  const deactivate = entry => {
+    entry?.menu?.classList.remove("show")
+    entry?.trigger?.classList.remove("active")
+  }
+
+  /** Close the submenu at `depth` and everything deeper. Default closes all. */
+  const close = (depth = LEVEL.SECOND) => chain.splice(depth).forEach(deactivate)
+
+  /**
+   * Open `menu` activated by `trigger` at `depth`.
+   * Everything at `depth` and deeper is closed first; reopening the same entry is a no-op.
+   * `menu` may be null: only `trigger` gets `active`.
+   */
+  const open = (depth, menu, trigger) => {
+    const cur = chain[depth]
+    if (cur && cur.menu === menu && cur.trigger === trigger) return
+    close(depth)
+    if (!trigger) return
+    chain[depth] = { menu, trigger }
+    trigger.classList.add("active")
+    menu?.classList.add("show")
+  }
+
+  return { open, close }
+}
+
+const SUBMENU_CLASS = "dropdown-menu context-menu ext-context-menu"
+
+const hasOverridePluginFn = (plugin, fn) => plugin[fn] !== BasePlugin.prototype[fn]
+
+class RightClickMenuPlugin extends BasePlugin {
+  groupName = "typora-plugin"
+  noExtraMenuGroupName = "typora-plugin-no-extra"
+  dividerValue = "---"
+  unavailableActValue = "__not_available__"
+  unavailableActName = this.i18n.t("act.disabled")
+  defaultDisableHint = this.i18n.t("actHint.disabled")
+  supportShortcut = !!document.querySelector(".ty-menu-shortcut")
+  menuManager = createMenuManager()
+
+  style = () => `
+.plugin-menu-2nd.ext-context-menu, .plugin-menu-3rd.ext-context-menu { min-width: ${this.config.MENU_MIN_WIDTH}; }
+#context-menu > li:not([data-key="typora-plugin"]) { display: ${this.config.HIDE_OTHER_OPTIONS ? "none" : ""}; }
+.context-menu .state-run:before { content: '\\2318'; margin-left: -10px; margin-right: 10px; }
+.ty-menu-shortcut { padding-left: 1em; }`
+
+  process = () => {
+    this.utils.settings.autoSave(this)
+    this.utils.eventHub.on(this.utils.eventHub.eventType.allPluginsHadInjected, () => {
+      setTimeout(() => {
+        this._insertLevel1()  // The 1st level menus group all plugins
+        this._insertLevel2()  // The 2nd level menus display grouped plugins
+        this._insertLevel3()  // The 3rd level menus display the actions of the plugin
+        this._listen()
+      }, 500)
+    })
+  }
+
+  _insertLevel1 = () => {
+    const items = this.config.MENUS.map(({ NAME, LIST = [] }, idx) => {
+      if (LIST.length === 0) {
+        return ""
+      }
+      const name = this.i18n._t("settings", NAME)
+      const noExtraMenu = LIST.length === 1
+      const caret = noExtraMenu ? "" : `<i class="fa fa-caret-right"></i>`
+      const a = `<a role="menuitem"><span data-lg="Menu" data-localize="${name}">${name}</span>${caret}</a>`
+      return noExtraMenu
+        ? `<li data-key="${this.noExtraMenuGroupName}" data-value="${LIST[0]}" data-idx="${idx}">${a}</li>`
+        : `<li class="has-extra-menu" data-key="${this.groupName}" data-idx="${idx}">${a}</li>`
+    })
+    const html = `<li class="divider"></li>` + items.join("")
+    document.querySelector("#context-menu").insertAdjacentHTML("beforeend", html)
+  }
+
+  _insertLevel2 = () => {
+    const LiWithAction = (plugin, action) => {
+      const name = plugin.staticActions.find(act => act.act_value === action)?.act_name || plugin.pluginName
+      return `
+        <li class="plugin-menu-item" data-key="${plugin.fixedName}" data-value="${action}">
+          <a role="menuitem" data-lg="Menu" data-localize="${name}">${name}</a>
+        </li>`
+    }
+    const Li = plugin => {
+      const hasAction = plugin.staticActions || plugin.getDynamicActions
+      const extraClass = hasAction ? "has-extra-menu" : ""
+      const callable = hasAction || hasOverridePluginFn(plugin, "call")
+      const style = callable ? "" : `style="opacity: 0.5; pointer-events: none;"`
+      const liAttrs = `class="plugin-menu-item ${extraClass}" ${style}`
+      return this._liTemplate(plugin.fixedName, plugin.pluginName, plugin.config.HOTKEY, hasAction, "", liAttrs)
+    }
+
+    const className = `plugin-menu-2nd ${SUBMENU_CLASS}`
+    const html = this.config.MENUS.map(({ LIST = [] }, idx) => {
+      const children = LIST.map(item => {
+        if (item === this.dividerValue) return `<li class="divider"></li>`
+        const [fixedName, action] = item.split(".")
+        const plugin = this.utils.getPlugin(fixedName)
+        if (!plugin) return ""
+        return action ? LiWithAction(plugin, action) : Li(plugin)
+      })
+      return `<ul role="menu" data-idx="${idx}" class="${className}">${children.join("")}</ul>`
+    })
+    this.utils.entities.eContent.insertAdjacentHTML("beforeend", html.join(""))
+  }
+
+  _insertLevel3 = () => {
+    const className = `plugin-menu-3rd ${SUBMENU_CLASS}`
+    const html = this.config.MENUS.flatMap(({ LIST = [] }, idx) => {
+      return LIST
+        .filter(item => item !== this.dividerValue)
+        .map(item => this.utils.getPlugin(item.split(".")[0]))
+        .filter(plugin => plugin && (plugin.staticActions || plugin.getDynamicActions))
+        .map(plugin => {
+          const children = (plugin.staticActions || []).map(act => this._thirdLiTemplate(act)).join("")
+          return `<ul role="menu" data-idx="${idx}" data-plugin="${plugin.fixedName}" class="${className}">${children}</ul>`
+        })
+    })
+    this.utils.entities.eContent.insertAdjacentHTML("beforeend", html.join(""))
+  }
+
+  _thirdLiTemplate = (act, dynamic) => {
+    const classList = ["plugin-menu-item"]
+    if (dynamic) classList.push("plugin-dynamic-act")
+    if (act.act_hidden) classList.push("plugin-common-hidden")
+    if (act.act_disabled) classList.push("disabled")
+
+    const hint = act.act_hint || (act.act_disabled ? this.defaultDisableHint : "")
+    const liExtraAttrs = (hint ? `ty-hint="${hint}" ` : "") + `class="${classList.join(" ")}"`
+
+    const state = (this.config.SHOW_ACTION_OPTIONS_ICON && act.act_state === undefined)
+      ? "state-run"
+      : Boolean(act.act_state) ? "state-on" : "state-off"
+
+    return this._liTemplate(act.act_value, act.act_name, act.act_hotkey, false, state, liExtraAttrs)
+  }
+
+  _liTemplate = (key, showName, shortcut, hasExtraMenu, aClassName = "", liExtraAttrs = "") => {
+    shortcut = this._cleanShortcut(shortcut)
+    const hasShortcut = this.supportShortcut && this.config.SHOW_PLUGIN_HOTKEY && shortcut
+    let inner = ""
+    let aAttrs = `data-lg="Menu"`
+    if (hasExtraMenu) {
+      inner = `<span data-lg="Menu" data-localize="${showName}">${showName}</span><i class="fa fa-caret-right"></i>`
+    } else if (hasShortcut) {
+      inner = `<span data-localize="${showName}">${showName}</span><span class="ty-menu-shortcut">${shortcut}</span>`
+    } else {
+      inner = showName
+      aAttrs += ` data-localize="${showName}"`
+    }
+    return `<li data-key="${key}" ${liExtraAttrs.trim()}><a role="menuitem" class="${aClassName}" ${aAttrs}>${inner}</a></li>`.trim()
+  }
+
+  _cleanShortcut = shortcut => {
+    if (Array.isArray(shortcut)) {
+      shortcut = shortcut[0]
+    }
+    if (shortcut && typeof shortcut === "string") {
+      shortcut = this.utils.hotkeyHub.capitalize(shortcut)
+    }
+    return shortcut
+  }
+
+  _showMenuItem = (after, before) => {
+    const margin = 6
+    const { left, top, width, height } = before.getBoundingClientRect()
+    let afterTop = top - height
+    let afterLeft = left + width + margin
+
+    const footer = document.querySelector("footer")
+    const footerHeight = footer ? footer.getBoundingClientRect().height : 0
+
+    const { height: afterHeight, width: afterWidth } = after.getBoundingClientRect()
+    afterTop = Math.min(afterTop, window.innerHeight - afterHeight - footerHeight)
+    afterLeft = afterLeft + afterWidth < window.innerWidth ? afterLeft : Math.max(0, left - afterWidth - margin)
+    after.style.top = afterTop + "px"
+    after.style.left = afterLeft + "px"
+  }
+
+  _listen = () => {
+    const self = this
+    const { menuManager } = this
+
+    // Click on the 1st level menu
+    $("#context-menu").on("click", `[data-key="${this.noExtraMenuGroupName}"]`, function () {
+      const [fixedName, action] = (this.dataset.value || "").split(".")
+      if (!fixedName) return false
+      self.utils.updatePluginDynamicActions(fixedName)
+      self.callPluginAction(fixedName, action)
+      self._hideMenuIfNeed()
+      // Display the 2nd level menu
+    }).on("mouseenter", "[data-key]", function () {
+      if (self.groupName !== this.dataset.key) {
+        menuManager.close()
+        return
+      }
+      const secondMenu = document.querySelector(`.plugin-menu-2nd[data-idx="${this.dataset.idx}"]`)
+      menuManager.open(LEVEL.SECOND, secondMenu, this)
+      if (secondMenu) {
+        self._showMenuItem(secondMenu, this)
+      }
+    })
+
+    // Display the 3rd level menu
+    $(".plugin-menu-2nd").on("mouseenter", "[data-key]", function () {
+      document.querySelectorAll(".plugin-dynamic-act").forEach(el => el.remove())
+      const fixedName = this.dataset.key
+      const third = document.querySelector(`.plugin-menu-3rd[data-plugin="${fixedName}"]`)
+      const noStaticActions = third && third.children.length === 0
+      let dynamicActions = self.utils.updatePluginDynamicActions(fixedName)
+      const noDynamicActions = !dynamicActions || dynamicActions.length === 0
+      if (noDynamicActions && noStaticActions) {
+        dynamicActions = [{ act_name: self.unavailableActName, act_value: self.unavailableActValue, act_disabled: true }]
+      }
+      if (dynamicActions && third) {
+        const html = dynamicActions.map(act => self._thirdLiTemplate(act, true)).join("")
+        third.insertAdjacentHTML("beforeend", html)
+      }
+      if (this.classList.contains("has-extra-menu")) {
+        menuManager.open(LEVEL.THIRD, third, this)
+        if (third) {
+          self._showMenuItem(third, this)
+        }
+      } else {
+        menuManager.close(LEVEL.THIRD)
+      }
+      // Call plugins in the 2nd level menu
+    }).on("click", "[data-key]", function () {
+      const fixedName = this.dataset.key
+      const action = this.dataset.value
+      if (action) {
+        self.callPluginAction(fixedName, action)
+      } else {
+        const plugin = self.utils.getPlugin(fixedName)
+        // If there is a 3rd level menu, clicking the 2nd level menu is not allowed.
+        if (!plugin || plugin.staticActions || plugin.getDynamicActions) return false
+        plugin.call?.()
+      }
+      self._hideMenuIfNeed()
+    })
+
+    // Call plugins in the 3rd level menu
+    $(".plugin-menu-3rd").on("click", "[data-key]", function () {
+      if (this.classList.contains("disabled")) return false
+
+      const action = this.dataset.key
+      const fixedName = this.parentElement.dataset.plugin
+      self.callPluginAction(fixedName, action)
+      const hidden = self._hideMenuIfNeed()
+      if (!hidden) $(`.plugin-menu-item[data-key="${fixedName}"]`).trigger("mouseenter") // refresh 3rd menu
+    })
+  }
+
+  _hideMenuIfNeed = () => {
+    if (this.config.RETAIN_ON_BLUR) return false
+    File.editor.contextMenu.hide()
+    this.menuManager.close()
+    return true
+  }
+
+  callPluginAction = (fixedName, action) => {
+    if (action !== this.unavailableActValue) {
+      this.utils.callPluginAction(fixedName, action)
+    }
+  }
+
+  getDynamicActions = () => this.i18n.fillActions([
+    { act_value: "retain_on_blur", act_state: this.config.RETAIN_ON_BLUR, act_hint: this.i18n.t("actHint.retain_on_blur") },
+    { act_value: "toggle_hotkey", act_state: this.config.SHOW_PLUGIN_HOTKEY, act_hidden: !this.supportShortcut },
+    { act_value: "hide_other_options", act_state: this.config.HIDE_OTHER_OPTIONS },
+  ])
+
+  call = action => {
+    const fns = {
+      retain_on_blur: () => this.config.RETAIN_ON_BLUR = !this.config.RETAIN_ON_BLUR,
+      hide_other_options: () => {
+        this.config.HIDE_OTHER_OPTIONS = !this.config.HIDE_OTHER_OPTIONS
+        this.utils.replaceStyle(this.fixedName, this.style())
+      },
+      toggle_hotkey: () => {
+        this.config.SHOW_PLUGIN_HOTKEY = !this.config.SHOW_PLUGIN_HOTKEY
+        document.querySelectorAll(".plugin-menu-2nd .ty-menu-shortcut, .plugin-menu-3rd .ty-menu-shortcut")
+          .forEach(el => el.classList.toggle("plugin-common-hidden", !this.config.SHOW_PLUGIN_HOTKEY))
+      },
+    }
+    fns[action]?.()
+  }
+}
+
+module.exports = {
+  plugin: RightClickMenuPlugin,
+}

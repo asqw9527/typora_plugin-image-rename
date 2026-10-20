@@ -1,0 +1,43 @@
+# image_rename 插件配置
+# 命名模板与冲突策略对齐 Obsidian「Image Converter」插件的
+# 「自定义图片名称 / 如果输出文件已存在」设置。
+# 把 [image_rename] 段合并进框架全局配置（plugin/global/settings.toml），
+# 或将本文件直接放在插件文件夹内作为默认值，重启 Typora 生效。
+
+[image_rename]
+# 是否启用（框架约定项）
+ENABLE = true
+
+# 自定义图片名称（同 Image Converter 的「自定义图片名称」输入框）
+# 可用占位符：
+#   {notename}            当前笔记名            例：午信项目自发放版件步骤
+#   {notename_nospaces}   笔记名（空格转下划线）
+#   {notefolder}          笔记所在文件夹名
+#   {imagename}           原图片文件名（不含扩展名）
+#   {filetype} / {ext}    扩展名（不含点）
+#   {date}                2026-10-16
+#   {time}                18-44-30
+#   {YYYY} {MM} {DD}      年 / 月 / 日（补零）
+#   {HH} {mm} {ss}        时 / 分 / 秒（补零）
+#   {date:FORMAT}         自定义格式（支持 YYYY YY MM DD HH mm ss dddd MMM ddd）
+#   {timestamp}           Unix 时间戳（秒）
+#   {weekday} {month}     星期几 / 月份英文名
+#   {today} {yesterday} {tomorrow}
+#
+# 默认模板与你在 Obsidian 里实际生效的预设一致：
+#   Image{notename}-{date}  {HH}：{mm}
+#   → 例：Image午信项目自发放版件步骤-2026-10-16  18：44.png
+# 注意：模板里如写半角冒号 ":"，生成文件名时会自动转为全角 "："
+#（Windows 文件名不允许半角冒号），其余非法字符转为下划线。
+PATTERN = "Image{notename}-{date}  {HH}：{mm}"
+
+# 如果输出文件已存在（同 Image Converter 的冲突下拉框）：
+#   increment = 添加数字后缀（-1、-2 等）   ← 默认
+#   skip      = 保持原名不动
+CONFLICT_MODE = "increment"
+
+# 仅对“最近多少毫秒内新建”的图片自动改名，避免误伤手动命名的图片
+RECENT_MS = 20000
+
+# 是否开启自动改名（粘贴/拖入时）。false 则只用手动命令
+RENAME_AUTO = true

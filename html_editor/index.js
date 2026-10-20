@@ -1,0 +1,829 @@
+const { randomBytes } = require("crypto")
+const { fileURLToPath, pathToFileURL } = require("url")
+const {
+  annotateSourceOffsets,
+  applyAttributeReplacements,
+  buildPreviewDocument,
+  buildSandbox,
+  collectImageReferences,
+  discoverRemoteBase,
+  isHtmlFile,
+  isRelatedDocumentHref,
+  normalizeOptions,
+  parseSrcset,
+} = require("./core")
+
+const MAX_IMAGE_BYTES = 12 * 1024 * 1024
+const MAX_IMAGE_REFERENCES = 64
+const IMAGE_MIME_TYPES = Object.freeze({
+  ".avif": "image/avif",
+  ".bmp": "image/bmp",
+  ".gif": "image/gif",
+  ".ico": "image/x-icon",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".webp": "image/webp",
+})
+
+const clampRatio = value => Math.max(0, Math.min(1, Number(value) || 0))
+
+const decodeUrlPath = value => {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+const detectImageMime = (buffer, resource = "", contentType = "") => {
+  const declared = String(contentType || "").split(";", 1)[0].trim().toLowerCase()
+  if (declared.startsWith("image/")) return declared
+  const extension = String(resource || "").split(/[?#]/, 1)[0]
+  const suffix = extension.slice(extension.lastIndexOf(".")).toLowerCase()
+  if (IMAGE_MIME_TYPES[suffix]) return IMAGE_MIME_TYPES[suffix]
+  if (!Buffer.isBuffer(buffer)) return ""
+  if (buffer.length >= 4 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return "image/png"
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg"
+  if (buffer.length >= 6 && /^GIF8[79]a$/.test(buffer.subarray(0, 6).toString("ascii"))) return "image/gif"
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp"
+  if (/^\s*(?:<\?xml[^>]*>\s*)?<svg\b/i.test(buffer.subarray(0, 512).toString("utf8"))) return "image/svg+xml"
+  return ""
+}
+
+const toDataUrl = (buffer, resource, contentType = "") => {
+  const mime = detectImageMime(buffer, resource, contentType)
+  return mime ? `data:${mime};base64,${buffer.toString("base64")}` : ""
+}
+
+const toBase64Url = buffer => buffer.toString("base64")
+  .replace(/\+/g, "-")
+  .replace(/\//g, "_")
+  .replace(/=+$/g, "")
+
+class HtmlEditorPlugin extends BasePlugin {
+  options = normalizeOptions(this.config)
+  sourceCache = new Map()
+  activeFile = ""
+  currentStat = null
+  savedSource = ""
+  viewMode = this.options.defaultView
+  previewTimer = null
+  previewUrl = ""
+  previewRenderToken = 0
+  previewBridgeToken = ""
+  remoteImageCache = new Map()
+  inspectorEnabled = false
+  syncingSourceScroll = false
+  activationToken = 0
+  bypassOpenGuard = false
+
+  prepare = async () => {
+    await this.utils.waitUntil(() => File, 50, 1500)
+    return Object.hasOwn(File, "readContentFrom") ? undefined : this.utils.PLUGIN_LOAD_ABORT
+  }
+
+  hotkey = () => [{ hotkey: this.config.HOTKEY, callback: this.call }]
+
+  style = () => true
+
+  html = () => `
+    <div id="plugin-html-file-view" class="html-file-view plugin-common-hidden is-${this.options.defaultView}" aria-label="${this.i18n.t("aria.fileView")}">
+      <div class="html-editor-header">
+        <div class="html-editor-heading">
+          <div class="html-editor-title">HTML</div>
+          <div class="html-editor-path"></div>
+        </div>
+        <div class="html-editor-button" role="button" tabindex="0" data-action="open" title="${this.i18n.t("action.openTitle")}"><div class="fa fa-folder-open-o" aria-hidden="true"></div>&nbsp;${this.i18n.t("action.open")}</div>
+        <div class="html-editor-button is-disabled" role="button" tabindex="-1" aria-disabled="true" data-action="save" title="${this.i18n.t("action.saveTitle")}"><div class="fa fa-save" aria-hidden="true"></div>&nbsp;${this.i18n.t("action.save")}</div>
+        <div class="html-editor-button" role="button" tabindex="0" data-action="reload" title="${this.i18n.t("action.reloadTitle")}"><div class="fa fa-refresh" aria-hidden="true"></div></div>
+        <div class="html-editor-button" role="button" tabindex="0" data-action="external" title="${this.i18n.t("action.externalTitle")}"><div class="fa fa-external-link" aria-hidden="true"></div></div>
+        <div class="html-editor-button" role="button" tabindex="0" data-action="inspect" aria-pressed="false" title="${this.i18n.t("action.inspectTitle")}"><div class="fa fa-crosshairs" aria-hidden="true"></div>&nbsp;${this.i18n.t("action.inspect")}</div>
+        <div class="html-editor-view-group" aria-label="${this.i18n.t("aria.viewMode")}">
+          <div class="html-editor-button" role="button" tabindex="0" data-view="source" aria-pressed="false">${this.i18n.t("view.source")}</div>
+          <div class="html-editor-button" role="button" tabindex="0" data-view="preview" aria-pressed="true">${this.i18n.t("view.preview")}</div>
+          <div class="html-editor-button" role="button" tabindex="0" data-view="split" aria-pressed="false">${this.i18n.t("view.split")}</div>
+        </div>
+      </div>
+      <div class="html-editor-workspace">
+        <div class="html-editor-pane html-editor-source-pane">
+          <textarea class="html-editor-source" aria-label="${this.i18n.t("aria.sourceEditor")}" spellcheck="false"></textarea>
+        </div>
+        <div class="html-editor-pane html-editor-preview-pane">
+          <iframe class="html-editor-preview" title="${this.i18n.t("aria.preview")}" sandbox="" referrerpolicy="no-referrer"></iframe>
+          <div class="html-editor-inspector plugin-common-hidden" aria-label="${this.i18n.t("aria.inspector")}">
+            <div class="html-editor-inspector-header">
+              <div class="html-editor-inspector-title">${this.i18n.t("inspector.title")}</div>
+              <div class="html-editor-button" role="button" tabindex="0" data-action="close-inspector" title="${this.i18n.t("inspector.close")}">×</div>
+            </div>
+            <div class="html-editor-inspector-body">
+              <div class="html-editor-inspector-tag">${this.i18n.t("inspector.noSelection")}</div>
+              <div class="html-editor-inspector-selector"></div>
+              <div class="html-editor-inspector-box"></div>
+              <details open><summary>${this.i18n.t("inspector.attributes")}</summary><pre class="html-editor-inspector-attributes"></pre></details>
+              <details><summary>${this.i18n.t("inspector.text")}</summary><pre class="html-editor-inspector-text"></pre></details>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="html-editor-footer">
+        <div class="html-editor-status" aria-live="polite"></div>
+        <div class="html-editor-security"></div>
+      </div>
+    </div>
+  `
+
+  init = () => {
+    const root = document.querySelector("#plugin-html-file-view")
+    this.entities = {
+      root,
+      content: this.utils.entities.eContent,
+      title: root.querySelector(".html-editor-title"),
+      path: root.querySelector(".html-editor-path"),
+      source: root.querySelector(".html-editor-source"),
+      preview: root.querySelector(".html-editor-preview"),
+      status: root.querySelector(".html-editor-status"),
+      security: root.querySelector(".html-editor-security"),
+      open: root.querySelector('[data-action="open"]'),
+      save: root.querySelector('[data-action="save"]'),
+      reload: root.querySelector('[data-action="reload"]'),
+      external: root.querySelector('[data-action="external"]'),
+      inspect: root.querySelector('[data-action="inspect"]'),
+      closeInspector: root.querySelector('[data-action="close-inspector"]'),
+      inspector: root.querySelector(".html-editor-inspector"),
+      inspectorTag: root.querySelector(".html-editor-inspector-tag"),
+      inspectorSelector: root.querySelector(".html-editor-inspector-selector"),
+      inspectorBox: root.querySelector(".html-editor-inspector-box"),
+      inspectorAttributes: root.querySelector(".html-editor-inspector-attributes"),
+      inspectorText: root.querySelector(".html-editor-inspector-text"),
+      views: [...root.querySelectorAll("[data-view]")],
+    }
+    this.entities.source.style.fontSize = `${this.options.editorFontSize}px`
+    this._setViewMode(this.viewMode, false)
+    this._syncSecurityLabel()
+  }
+
+  process = () => {
+    this._registerFileTypes(false)
+    this._installReadMask()
+    this._installOpenGuard()
+    this._installSaveRedirect()
+
+    this.entities.open.addEventListener("click", () => this._chooseFile())
+    this.entities.save.addEventListener("click", () => {
+      if (this.entities.save.getAttribute("aria-disabled") !== "true") this._save()
+    })
+    this.entities.reload.addEventListener("click", () => this._reload())
+    this.entities.external.addEventListener("click", () => this.activeFile && this.utils.openPath(this.activeFile))
+    this.entities.inspect.addEventListener("click", () => this._toggleInspector())
+    this.entities.closeInspector.addEventListener("click", () => this._toggleInspector(false))
+    this.entities.views.forEach(button => button.addEventListener("click", () => this._setViewMode(button.dataset.view)))
+    this.entities.root.addEventListener("keydown", this._handleControlKeydown)
+    this.entities.source.addEventListener("input", this._handleSourceInput)
+    this.entities.source.addEventListener("keydown", this._handleEditorKeydown)
+    this.entities.source.addEventListener("scroll", this._handleSourceScroll, { passive: true })
+    this.entities.preview.addEventListener("load", this._handlePreviewLoad)
+    document.addEventListener("keydown", this._handleDocumentKeydown, true)
+    window.addEventListener("beforeunload", this._handleBeforeUnload)
+    window.addEventListener("message", this._handlePreviewMessage)
+
+    this.utils.eventHub.on(this.utils.eventHub.eventType.fileContentLoaded, this._handleFileContentLoaded)
+    this.utils.eventHub.on(this.utils.eventHub.eventType.allPluginsHadInjected, () => this._registerFileTypes(true))
+  }
+
+  call = () => {
+    if (this.activeFile) {
+      this._setViewMode(this.viewMode === "preview" ? "source" : "preview")
+    } else {
+      this._chooseFile()
+    }
+  }
+
+  _registerFileTypes = (refresh = true) => {
+    if (!this.options.showInFileTree || !Array.isArray(File?.SupportedFiles)) return false
+    let changed = false
+    for (const extension of ["html", "htm"]) {
+      if (!File.SupportedFiles.includes(extension)) {
+        File.SupportedFiles.push(extension)
+        changed = true
+      }
+    }
+    if (refresh) File.editor.library.refreshPanelCommand()
+    return changed
+  }
+
+  _installReadMask = () => {
+    this.utils.decorator.modifyReturn(
+      () => File,
+      "readContentFrom",
+      (result, filePath) => this._maskHtmlReadResult(result, filePath),
+      { priority: -200 },
+    ).catch(error => this._showError(this.i18n.t("error.hookRead"), error))
+  }
+
+  _maskHtmlReadResult = async (result, filePath) => {
+    const payload = await result
+    if (!isHtmlFile(filePath) || !Array.isArray(payload) || !payload[0]) return payload
+    const encoding = payload[2] || "utf8"
+    let source = String(payload[1] || "")
+    if (!source && Buffer.isBuffer(payload[3]) && payload[3].length) {
+      try {
+        source = payload[3].toString(encoding.replace(/-bom$/i, ""))
+      } catch {
+        source = payload[3].toString("utf8")
+      }
+    }
+    const entry = { source, encoding }
+    this.sourceCache.set(String(filePath), entry)
+    this.sourceCache.set(this._normalizedPath(filePath), entry)
+    return [true, "", entry.encoding, Buffer.alloc(0)]
+  }
+
+  _installOpenGuard = () => {
+    this.utils.decorator.preventCallIf(
+      () => File?.editor?.library,
+      "openFile",
+      target => {
+        if (this.bypassOpenGuard || !this._isDirty() || this._samePath(target, this.activeFile)) return false
+        const name = this.utils.Package.Path.basename(target || "")
+        this._confirmDiscard(this.i18n.t("action.openTarget", { name })).then(confirmed => {
+          if (!confirmed) return
+          this.bypassOpenGuard = true
+          try {
+            File.editor.library.openFile(target)
+          } finally {
+            this.bypassOpenGuard = false
+          }
+        })
+        return true
+      },
+      { priority: -200 },
+    ).catch(error => this._showError(this.i18n.t("error.hookSwitch"), error))
+  }
+
+  _installSaveRedirect = () => {
+    this.utils.decorator.preventCallIf(
+      () => File,
+      "saveUseNode",
+      () => {
+        if (!this.activeFile || !this._samePath(this.utils.getFilePath(), this.activeFile)) return false
+        this._save()
+        return true
+      },
+      { priority: -200 },
+    ).catch(error => this._showError(this.i18n.t("error.hookSave"), error))
+  }
+
+  _handleFileContentLoaded = filePath => {
+    const target = filePath || this.utils.getFilePath()
+    if (isHtmlFile(target)) {
+      this._activateFile(target)
+    } else {
+      this._deactivateFile()
+    }
+  }
+
+  _activateFile = async filePath => {
+    const token = ++this.activationToken
+    try {
+      await this._loadSourceFile(filePath)
+      if (token !== this.activationToken) return
+      if (File?.bundle) {
+        File.bundle.unsupported = File.UNSUPPORTED_REASON?.OTHER_FILE || "OTHER_FILE"
+      }
+      this.entities.content.classList.add("plugin-html-file-active")
+      this.entities.root.classList.remove("plugin-common-hidden")
+      this._setViewMode(this.options.defaultView)
+      this._syncUI(this.i18n.t("status.loaded"))
+    } catch (error) {
+      this._showError(this.i18n.t("error.load"), error)
+      this._deactivateFile()
+    }
+  }
+
+  _deactivateFile = () => {
+    this.activationToken++
+    this.previewRenderToken++
+    clearTimeout(this.previewTimer)
+    this.entities.content.classList.remove("plugin-html-file-active")
+    this.entities.root.classList.add("plugin-common-hidden")
+    this.activeFile = ""
+    this.currentStat = null
+    this.savedSource = ""
+    this.entities.source.value = ""
+    this.entities.preview.removeAttribute("src")
+    this.previewBridgeToken = ""
+    this.inspectorEnabled = false
+    this.entities.inspect?.setAttribute("aria-pressed", "false")
+    this.entities.inspector?.classList.add("plugin-common-hidden")
+    this._releasePreviewUrl()
+  }
+
+  _loadSourceFile = async filePath => {
+    if (!isHtmlFile(filePath)) throw new TypeError(this.i18n.t("error.unsupported"))
+    const resolved = this._normalizedPath(filePath)
+    const cached = this.sourceCache.get(String(filePath)) || this.sourceCache.get(resolved)
+    const source = cached?.source ?? await this.utils.Package.FsExtra.readFile(filePath, "utf8")
+    const stat = await this.utils.Package.FsExtra.stat(filePath)
+
+    this.activeFile = resolved
+    this.currentStat = { mtimeMs: stat.mtimeMs, size: stat.size }
+    this.savedSource = source
+    this.entities.source.value = source
+    this.sourceCache.delete(String(filePath))
+    this.sourceCache.delete(resolved)
+    void this._renderPreview()
+    this._syncUI(this.i18n.t("status.loaded"))
+    return source
+  }
+
+  _chooseFile = async () => {
+    if (this._isDirty() && !await this._confirmDiscard(this.i18n.t("action.openOther"))) return
+    try {
+      const { canceled, filePaths } = await JSBridge.invoke("dialog.showOpenDialog", {
+        title: this.i18n.t("dialog.openTitle"),
+        properties: ["openFile"],
+        filters: [{ name: this.i18n.t("dialog.htmlFiles"), extensions: ["html", "htm"] }],
+      })
+      if (!canceled && filePaths?.[0]) this.utils.openFile(filePaths[0])
+    } catch (error) {
+      this._showError(this.i18n.t("error.open"), error)
+    }
+  }
+
+  _save = async () => {
+    if (!this.activeFile) return false
+    try {
+      if (await this._hasExternalChange() && !await this._confirmExternalOverwrite()) return false
+      const source = this.entities.source.value
+      await this.utils.Package.FsExtra.writeFile(this.activeFile, source, "utf8")
+      const stat = await this.utils.Package.FsExtra.stat(this.activeFile)
+      this.currentStat = { mtimeMs: stat.mtimeMs, size: stat.size }
+      this.savedSource = source
+      this._syncUI(this.i18n.t("status.saved"))
+      this._notify(this.i18n.t("notify.saved"), "success")
+      return true
+    } catch (error) {
+      this._showError(this.i18n.t("error.save"), error)
+      return false
+    }
+  }
+
+  _reload = async () => {
+    if (!this.activeFile || this._isDirty() && !await this._confirmDiscard(this.i18n.t("action.reload"))) return
+    const filePath = this.activeFile
+    this.sourceCache.delete(filePath)
+    try {
+      await this._loadSourceFile(filePath)
+    } catch (error) {
+      this._showError(this.i18n.t("error.reload"), error)
+    }
+  }
+
+  _handleSourceInput = () => {
+    this._syncUI()
+    if (this.options.autoPreview) this._schedulePreview()
+  }
+
+  _handleEditorKeydown = event => {
+    if (event.key !== "Tab") return
+    event.preventDefault()
+    const { selectionStart, selectionEnd, value } = this.entities.source
+    this.entities.source.value = `${value.slice(0, selectionStart)}  ${value.slice(selectionEnd)}`
+    this.entities.source.selectionStart = this.entities.source.selectionEnd = selectionStart + 2
+    this._handleSourceInput()
+  }
+
+  _handleControlKeydown = event => {
+    const control = event.target.closest?.('.html-editor-button[role="button"]')
+    if (!control || control.getAttribute("aria-disabled") === "true") return
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault()
+      event.stopPropagation()
+      control.click()
+    }
+  }
+
+  _handleDocumentKeydown = event => {
+    if (!this.activeFile || !this.entities.content.classList.contains("plugin-html-file-active")) return
+    if (!(event.ctrlKey || event.metaKey)) return
+    const key = event.key.toLowerCase()
+    if (key === "s") {
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      this._save()
+    } else if (key === "o") {
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      this._chooseFile()
+    } else if (key === "e") {
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      this._setViewMode(this.viewMode === "preview" ? "source" : "preview")
+    }
+  }
+
+  _handleBeforeUnload = event => {
+    if (!this._isDirty()) return
+    event.preventDefault()
+    event.returnValue = ""
+  }
+
+  _setViewMode = (mode, shouldRender = true) => {
+    if (!["source", "preview", "split"].includes(mode)) mode = "preview"
+    this.viewMode = mode
+    this.entities.root.classList.remove("is-source", "is-preview", "is-split")
+    this.entities.root.classList.add(`is-${mode}`)
+    this.entities.views.forEach(button => button.setAttribute("aria-pressed", String(button.dataset.view === mode)))
+    if (mode === "source" && this.inspectorEnabled) this._toggleInspector(false)
+    if (shouldRender && mode !== "source") this._renderPreview()
+    this._postPreviewMessage("html-editor:set-sync", { enabled: this.options.splitSync && mode === "split" })
+    if (mode !== "preview") this.entities.source.focus()
+  }
+
+  _schedulePreview = () => {
+    clearTimeout(this.previewTimer)
+    this.previewTimer = setTimeout(() => this._renderPreview(), this.options.previewDelay)
+  }
+
+  _renderPreview = async () => {
+    const renderToken = ++this.previewRenderToken
+    const source = this.entities.source.value
+    this._syncUI(this.i18n.t("status.preparingPreview"))
+    const preparedSource = await this._preparePreviewSource(source, renderToken)
+    if (renderToken !== this.previewRenderToken || !this.entities.preview) return false
+    const path = this.utils.Package.Path
+    const baseHref = this.activeFile
+      ? pathToFileURL(path.dirname(this.activeFile) + path.sep).href
+      : ""
+    const runtimeNonce = toBase64Url(randomBytes(18))
+    const bridgeToken = toBase64Url(randomBytes(24))
+    const previewDocument = buildPreviewDocument(preparedSource, {
+      baseHref,
+      allowScripts: this.options.allowScripts,
+      allowNetwork: this.options.allowNetwork,
+      splitSync: this.options.splitSync,
+      runtimeNonce,
+      bridgeToken,
+    })
+    const retiredUrl = this.previewUrl
+    this.previewBridgeToken = bridgeToken
+    this.previewUrl = URL.createObjectURL(new Blob([previewDocument], { type: "text/html;charset=utf-8" }))
+    this.entities.preview.setAttribute("sandbox", buildSandbox({ ...this.options, allowRuntime: true }))
+    this.entities.preview.src = this.previewUrl
+    if (retiredUrl) URL.revokeObjectURL(retiredUrl)
+    this._syncUI(this.i18n.t("status.previewUpdated"))
+    return true
+  }
+
+  _preparePreviewSource = async source => {
+    const annotated = annotateSourceOffsets(source)
+    const references = collectImageReferences(annotated).slice(0, MAX_IMAGE_REFERENCES)
+    if (!references.length) return annotated
+    const remoteBase = discoverRemoteBase(source)
+    const replacements = await Promise.all(references.map(async reference => {
+      if (reference.attribute === "srcset") {
+        const entries = parseSrcset(reference.value)
+        if (!entries.length) return null
+        const resolved = await Promise.all(entries.map(async entry => ({
+          ...entry,
+          url: await this._resolvePreviewImage(entry.url, remoteBase),
+        })))
+        return {
+          start: reference.valueStart,
+          end: reference.valueEnd,
+          value: resolved.map(entry => `${entry.url}${entry.descriptor ? ` ${entry.descriptor}` : ""}`).join(", "),
+        }
+      }
+      return {
+        start: reference.valueStart,
+        end: reference.valueEnd,
+        value: await this._resolvePreviewImage(reference.value, remoteBase),
+      }
+    }))
+    return applyAttributeReplacements(annotated, replacements.filter(Boolean))
+  }
+
+  _resolvePreviewImage = async (value, remoteBase) => {
+    const resource = String(value || "").trim()
+    if (!resource || /^(?:data|blob|about|javascript):/i.test(resource) || resource.startsWith("#")) return resource
+    const localPath = this._resolveLocalResourcePath(resource)
+    if (localPath) {
+      const localData = await this._readLocalImage(localPath)
+      if (localData) return localData
+    }
+    if (!this.options.allowNetwork) return resource
+    const remoteUrl = this._resolveRemoteResourceUrl(resource, remoteBase)
+    return remoteUrl ? this._downloadRemoteImage(remoteUrl, resource) : resource
+  }
+
+  _resolveLocalResourcePath = resource => {
+    const path = this.utils.Package.Path
+    const mountFolder = this.utils.getMountFolder() || ""
+    try {
+      if (/^file:/i.test(resource)) return fileURLToPath(new URL(resource))
+      if (/^https?:/i.test(resource) || /^[A-Za-z][A-Za-z\d+.-]*:/.test(resource) && !/^[A-Za-z]:[\\/]/.test(resource)) return ""
+      const clean = decodeUrlPath(resource.split(/[?#]/, 1)[0])
+      if (!clean) return ""
+      if (/^[\\/]{2}/.test(clean) || path.isAbsolute(clean) && !/^[\\/]/.test(clean)) return path.resolve(clean)
+      if (/^[\\/]/.test(clean) && mountFolder) return path.resolve(mountFolder, clean.replace(/^[\\/]+/, ""))
+      return this.activeFile ? path.resolve(path.dirname(this.activeFile), clean) : ""
+    } catch {
+      return ""
+    }
+  }
+
+  _readLocalImage = async filePath => {
+    const fs = this.utils.Package.FsExtra
+    try {
+      const stat = await fs.stat(filePath)
+      if (stat.isFile && !stat.isFile() || stat.size > MAX_IMAGE_BYTES) return ""
+      const buffer = await fs.readFile(filePath)
+      if (!Buffer.isBuffer(buffer) || buffer.length > MAX_IMAGE_BYTES) return ""
+      return toDataUrl(buffer, filePath)
+    } catch {
+      return ""
+    }
+  }
+
+  _resolveRemoteResourceUrl = (resource, remoteBase) => {
+    try {
+      const url = /^https?:/i.test(resource)
+        ? new URL(resource)
+        : remoteBase ? new URL(resource, remoteBase) : null
+      return url && /^https?:$/.test(url.protocol) ? url.href : ""
+    } catch {
+      return ""
+    }
+  }
+
+  _downloadRemoteImage = async (url, original) => {
+    if (!this.utils.fetch) return original
+    if (!this.remoteImageCache.has(url)) {
+      const pending = (async () => {
+        const response = await this.utils.fetch(url, {
+          timeout: 15000,
+          headers: { Accept: "image/avif,image/webp,image/svg+xml,image/*,*/*;q=0.8" },
+        })
+        if (!response?.ok) throw new Error(`HTTP ${response?.status || "error"}`)
+        const declaredLength = Number(response.headers?.get?.("content-length") || 0)
+        if (declaredLength > MAX_IMAGE_BYTES) throw new RangeError("remote image is too large")
+        const buffer = await response.buffer()
+        if (!Buffer.isBuffer(buffer) || buffer.length > MAX_IMAGE_BYTES) throw new RangeError("remote image is too large")
+        const dataUrl = toDataUrl(buffer, url, response.headers?.get?.("content-type") || "")
+        if (!dataUrl) throw new TypeError("remote response is not an image")
+        return dataUrl
+      })()
+      this.remoteImageCache.set(url, pending)
+    }
+    try {
+      return await this.remoteImageCache.get(url)
+    } catch (error) {
+      this.remoteImageCache.delete(url)
+      console.warn(`[html_editor] ${this.i18n.t("warn.imageDownload", { url })}`, error)
+      return original
+    }
+  }
+
+  _toggleInspector = (enabled = !this.inspectorEnabled) => {
+    this.inspectorEnabled = Boolean(enabled)
+    if (this.inspectorEnabled && this.viewMode === "source") this._setViewMode("split", false)
+    this.entities.inspect.setAttribute("aria-pressed", String(this.inspectorEnabled))
+    this.entities.inspector.classList.toggle("plugin-common-hidden", !this.inspectorEnabled)
+    this._postPreviewMessage("html-editor:set-inspector", { enabled: this.inspectorEnabled })
+  }
+
+  _handlePreviewLoad = () => {
+    this._postPreviewMessage("html-editor:set-inspector", { enabled: this.inspectorEnabled })
+    this._postPreviewMessage("html-editor:set-sync", { enabled: this.options.splitSync && this.viewMode === "split" })
+    if (this.options.splitSync && this.viewMode === "split") this._handleSourceScroll()
+  }
+
+  _postPreviewMessage = (type, payload = {}) => {
+    const target = this.entities.preview.contentWindow
+    if (!target || !this.previewBridgeToken) return false
+    target.postMessage({ channel: "typora-html-editor", token: this.previewBridgeToken, type, payload }, "*")
+    return true
+  }
+
+  _handlePreviewMessage = event => {
+    if (!this.entities.preview || event.source !== this.entities.preview.contentWindow) return
+    const data = event.data || {}
+    if (data.channel !== "typora-html-editor" || data.token !== this.previewBridgeToken) return
+    if (data.type === "html-editor:inspect") {
+      this._showInspectedElement(data.payload || {})
+    } else if (data.type === "html-editor:navigate") {
+      this._handlePreviewNavigation(data.payload || {})
+    } else if (data.type === "html-editor:scroll") {
+      this._handlePreviewScroll(data.payload || {})
+    } else if (data.type === "html-editor:ready") {
+      this._handlePreviewLoad()
+    }
+  }
+
+  _showInspectedElement = payload => {
+    this._toggleInspector(true)
+    this.entities.inspectorTag.textContent = `<${payload.tagName || "element"}>`
+    this.entities.inspectorSelector.textContent = payload.selector || ""
+    const box = payload.box || {}
+    this.entities.inspectorBox.textContent = Number.isFinite(box.width)
+      ? `${box.width} × ${box.height}px · x ${box.x}, y ${box.y}`
+      : ""
+    this.entities.inspectorAttributes.textContent = (payload.attributes || [])
+      .map(attribute => `${attribute.name}="${attribute.value}"`)
+      .join("\n") || this.i18n.t("inspector.noAttributes")
+    this.entities.inspectorText.textContent = payload.text || this.i18n.t("inspector.noText")
+    this._jumpToSource(payload.offset, payload.end)
+  }
+
+  _jumpToSource = (offset, end) => {
+    const source = this.entities.source
+    const start = Math.max(0, Math.min(source.value.length, Number(offset) || 0))
+    const finish = Math.max(start, Math.min(source.value.length, Number(end) || start))
+    if (this.viewMode !== "split") this._setViewMode("split", false)
+    source.focus?.()
+    if (source.setSelectionRange) source.setSelectionRange(start, finish)
+    else {
+      source.selectionStart = start
+      source.selectionEnd = finish
+    }
+    const line = source.value.slice(0, start).split("\n").length - 1
+    const lineHeight = this.options.editorFontSize * 1.55
+    source.scrollTop = Math.max(0, line * lineHeight - (source.clientHeight || 0) / 3)
+    return true
+  }
+
+  _handleSourceScroll = () => {
+    if (!this.options.splitSync || this.viewMode !== "split" || this.syncingSourceScroll) return
+    const source = this.entities.source
+    const maximum = Math.max(0, source.scrollHeight - source.clientHeight)
+    this._postPreviewMessage("html-editor:set-scroll-ratio", { ratio: maximum ? source.scrollTop / maximum : 0 })
+  }
+
+  _handlePreviewScroll = payload => {
+    if (!this.options.splitSync || this.viewMode !== "split") return
+    const source = this.entities.source
+    const maximum = Math.max(0, source.scrollHeight - source.clientHeight)
+    this.syncingSourceScroll = true
+    source.scrollTop = maximum * clampRatio(payload.ratio)
+    requestAnimationFrame(() => this.syncingSourceScroll = false)
+  }
+
+  _handlePreviewNavigation = async payload => {
+    const href = String(payload.href || "").trim()
+    if (!isRelatedDocumentHref(href)) return false
+    const localTarget = await this._resolveLocalDocumentTarget(href, payload.resolvedHref)
+    if (localTarget) {
+      this.utils.openFile(localTarget)
+      return true
+    }
+    const remoteBase = discoverRemoteBase(this.entities.source.value || "")
+    const external = this._resolveRemoteResourceUrl(payload.resolvedHref || href, remoteBase)
+      || this._resolveRemoteResourceUrl(href, remoteBase)
+    if (external) {
+      this.utils.openUrl(external)
+      return true
+    }
+    this._notify(this.i18n.t("notify.linkMissing"), "warning")
+    return false
+  }
+
+  _resolveLocalDocumentTarget = async (href, resolvedHref = "") => {
+    const path = this.utils.Package.Path
+    const candidates = []
+    const addCandidate = value => {
+      if (!value) return
+      const normalized = path.resolve(value)
+      if (!candidates.some(candidate => this._samePath(candidate, normalized))) candidates.push(normalized)
+    }
+    const addHrefCandidate = value => {
+      try {
+        if (/^file:/i.test(value)) {
+          addCandidate(fileURLToPath(new URL(value)))
+          return
+        }
+        if (/^https?:/i.test(value)) return
+        const clean = decodeUrlPath(String(value || "").split(/[?#]/, 1)[0])
+        if (!clean) return
+        if (path.isAbsolute(clean)) addCandidate(clean)
+        else if (this.activeFile) addCandidate(path.resolve(path.dirname(this.activeFile), clean))
+      } catch {}
+    }
+    addHrefCandidate(href)
+    addHrefCandidate(resolvedHref)
+
+    const remoteBase = discoverRemoteBase(this.entities.source.value || "")
+    if (remoteBase && this.activeFile) {
+      try {
+        const baseUrl = new URL(remoteBase)
+        const targetUrl = new URL(/^https?:/i.test(href) ? href : resolvedHref || href, remoteBase)
+        if (baseUrl.origin === targetUrl.origin) {
+          const relative = path.posix.relative(decodeUrlPath(baseUrl.pathname), decodeUrlPath(targetUrl.pathname))
+          addCandidate(path.resolve(path.dirname(this.activeFile), relative.split("/").join(path.sep)))
+        }
+      } catch {}
+    }
+
+    for (const candidate of candidates) {
+      try {
+        const stat = await this.utils.Package.FsExtra.stat(candidate)
+        if (!stat.isFile || stat.isFile()) return candidate
+      } catch {}
+    }
+    return ""
+  }
+
+  _releasePreviewUrl = () => {
+    const retiredUrl = this.previewUrl
+    this.previewUrl = ""
+    if (retiredUrl) URL.revokeObjectURL(retiredUrl)
+  }
+
+  _syncUI = message => {
+    if (!this.activeFile) return
+    const dirty = this._isDirty()
+    this.entities.title.textContent = `${this.utils.Package.Path.basename(this.activeFile)}${dirty ? " *" : ""}`
+    this.entities.path.textContent = this.activeFile
+    this._setControlDisabled(this.entities.save, !dirty)
+    this.entities.status.textContent = message || this.i18n.t("status.summary", {
+      state: this.i18n.t(dirty ? "status.dirty" : "status.clean"),
+      count: this.entities.source.value.length.toLocaleString(),
+    })
+  }
+
+  _syncSecurityLabel = () => {
+    const active = this.options.allowScripts || this.options.allowNetwork
+    this.entities.security.classList.toggle("is-warning", active)
+    const state = enabled => this.i18n.t(enabled ? "state.on" : "state.off")
+    this.entities.security.textContent = this.i18n.t("security.summary", {
+      scripts: state(this.options.allowScripts),
+      network: state(this.options.allowNetwork),
+      sync: state(this.options.splitSync),
+    })
+  }
+
+  _setControlDisabled = (control, disabled) => {
+    const isDisabled = Boolean(disabled)
+    control.classList.toggle("is-disabled", isDisabled)
+    control.setAttribute("aria-disabled", String(isDisabled))
+    control.tabIndex = isDisabled ? -1 : 0
+  }
+
+  _isDirty = () => Boolean(this.activeFile) && this.entities.source.value !== this.savedSource
+
+  _confirmDiscard = async action => {
+    if (!this._isDirty()) return true
+    const { response } = await this.utils.showMessageBox({
+      type: "warning",
+      title: this.pluginName,
+      message: this.i18n.t("dialog.discardMessage", { action }),
+      detail: this.activeFile,
+      buttons: [this.i18n.t("dialog.discard"), this.i18n.t("dialog.cancel")],
+      defaultId: 1,
+      cancelId: 1,
+    })
+    return response === 0
+  }
+
+  _hasExternalChange = async () => {
+    if (!this.currentStat) return false
+    try {
+      const stat = await this.utils.Package.FsExtra.stat(this.activeFile)
+      return stat.mtimeMs !== this.currentStat.mtimeMs || stat.size !== this.currentStat.size
+    } catch {
+      return true
+    }
+  }
+
+  _confirmExternalOverwrite = async () => {
+    const { response } = await this.utils.showMessageBox({
+      type: "warning",
+      title: this.pluginName,
+      message: this.i18n.t("dialog.overwriteMessage"),
+      detail: this.activeFile,
+      buttons: [this.i18n.t("dialog.overwrite"), this.i18n.t("dialog.cancel")],
+      defaultId: 1,
+      cancelId: 1,
+    })
+    return response === 0
+  }
+
+  _normalizedPath = filePath => this.utils.Package.Path.resolve(String(filePath || ""))
+
+  _samePath = (first, second) => {
+    if (!first || !second) return false
+    const a = this._normalizedPath(first)
+    const b = this._normalizedPath(second)
+    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b
+  }
+
+  _notify = (message, type = "info") => this.utils.notification.show(message, type, 4500)
+
+  _showError = (message, error) => {
+    console.error(`[html_editor] ${message}`, error)
+    this._notify(message, "error")
+  }
+}
+
+module.exports = { plugin: HtmlEditorPlugin }

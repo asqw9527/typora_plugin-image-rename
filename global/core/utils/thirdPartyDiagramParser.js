@@ -1,0 +1,390 @@
+class ThirdPartyDiagramParser {
+  parsers = new Map()
+  createConfigParser = metaConfigParserFactory()
+  DEFAULT_CSS = { width: "calc(100% - 4px)", height: "300px", backgroundColor: "transparent" }
+
+  constructor(utils) {
+    this.utils = utils
+    this.helpers = this.getHelpers()
+  }
+
+  /**
+   * @param lang {string}: Language.
+   * @param mappingLang {string}: Language to map to.
+   * @param destroyWhenUpdate {boolean}: Whether to clear the HTML in the preview before updating.
+   * @param interactiveMode {boolean}: When in interactive mode, code blocks will not automatically expand.
+   * @param metaConfigSchema {Object}: meta config schema.
+   * @param metaExtractor {function(string): {rawData: Object, cleanContent: string}}: Custom metadata extraction strategy.
+   * @param checkSelector {string}: Selector to check if the target Element exists under the current fence.
+   * @param wrapElement {string|function($pre):string}: If the target Element does not exist, create it.
+   * @param lazyLoadFunc {function(): Promise<null>}: Lazy load third-party resources.
+   * @param beforeRenderFunc {function(cid, content, $pre)}: Execute before rendering.
+   * @param renderStyleGetter {function($pre, $wrap, content, meta)}: Get styles for render.
+   * @param createFunc {function($wrap, string, meta): instance}: Create a diagram instance, passing in the target Element and the content of the fence.
+   * @param updateFunc {function($wrap, string, instance, meta): instance}: Update the diagram instance when the content is updated.
+   * @param destroyFunc {function(Object): null}: Destroy the diagram instance, passing in the diagram instance.
+   * @param beforeExportToNative {function(Element, instance): null}: Preparation operations before Pandoc export (e.g., adjusting diagram size, color, etc.).
+   * @param beforeExportToHTML {function(Element, instance): null}: Preparation operations before HTML export (e.g., adjusting diagram size, color, etc.).
+   * @param exportStyleGetter {function(lang): string}: Get styles for export.
+   * @param versionGetter {function(): string}: Get the version.
+   */
+  register = (
+    {
+      lang,
+      mappingLang = "",
+      destroyWhenUpdate,
+      interactiveMode = true,
+      metaConfigSchema,
+      metaExtractor,
+      checkSelector,
+      wrapElement,
+      lazyLoadFunc,
+      beforeRenderFunc,
+      renderStyleGetter,
+      createFunc,
+      updateFunc,
+      destroyFunc,
+      beforeExportToNative,
+      beforeExportToHTML,
+      exportStyleGetter,
+      versionGetter,
+    },
+  ) => {
+    lang = lang.toLowerCase()
+    lazyLoadFunc = this.utils.once(lazyLoadFunc)
+    const settingMsg = null
+    const metaConfigParser = metaConfigSchema ? this.createConfigParser(metaConfigSchema, metaExtractor) : null
+    this.parsers.set(lang, {
+      lang, mappingLang, destroyWhenUpdate, interactiveMode, settingMsg, metaConfigSchema, metaConfigParser,
+      checkSelector, wrapElement, lazyLoadFunc, beforeRenderFunc, renderStyleGetter,
+      createFunc, updateFunc, destroyFunc, beforeExportToNative, beforeExportToHTML,
+      versionGetter, instanceMap: new Map(),
+    })
+    this.utils.diagramParser.register({
+      lang, mappingLang, destroyWhenUpdate, exportStyleGetter, interactiveMode,
+      renderFunc: this.render, cancelFunc: this.cancel, destroyAllFunc: this.destroyAll,
+    })
+  }
+
+  unregister = lang => {
+    this.parsers.delete(lang)
+    this.utils.diagramParser.unregister(lang)
+  }
+
+  render = async (cid, rawContent, $pre, lang) => {
+    const parser = this.parsers.get(lang)
+    if (!parser) return
+
+    try {
+      await parser.lazyLoadFunc()
+      const payload = this._extractPayload(parser, cid, rawContent, $pre)
+      const $wrap = this._mountView(parser, $pre, payload)
+      let instance = this._createOrUpdate(parser, cid, payload.content, $wrap, lang, payload.meta)
+      // Q: Why not use `await this._createOrUpdate`?
+      // A: Some parsers' createFunc might preempt the element, causing a race condition if await is used.
+      if (typeof instance?.then === "function") {
+        instance = await instance
+      }
+      if (instance) {
+        parser.instanceMap.set(cid, instance)
+      }
+    } catch (e) {
+      const reason = `${e.stack}\n\nDiagram Parser Settings:\n${this._getSettingMsg(parser)}`
+      this.utils.diagramParser.throwParseError(null, reason)
+    }
+  }
+
+  _extractPayload = (parser, cid, rawContent, $pre) => {
+    let cleanContent = rawContent
+    let extractedMeta = {}
+    if (typeof parser.metaConfigParser === "function") {
+      const parsed = parser.metaConfigParser(rawContent)
+      extractedMeta = parsed.meta || {}
+      cleanContent = parsed.content ?? rawContent
+    }
+    const rawMeta = typeof parser.beforeRenderFunc === "function" ? parser.beforeRenderFunc(cid, cleanContent, $pre) : {}
+    return { content: cleanContent, meta: { ...rawMeta, ...extractedMeta } }
+  }
+
+  _mountView = (parser, $pre, payload) => {
+    const $wrap = this._getWrap(parser, $pre)
+    let cssConfig = { ...this.DEFAULT_CSS }
+    if (typeof parser.renderStyleGetter === "function") {
+      const userCss = parser.renderStyleGetter($pre, $wrap, payload.content, payload.meta)
+      cssConfig = { ...cssConfig, ...userCss }
+    }
+    $wrap.css(cssConfig)
+    return $wrap
+  }
+
+  _createOrUpdate = (parser, cid, content, $wrap, lang, meta) => {
+    const oldInstance = parser.instanceMap.get(cid)
+    if (oldInstance && parser.updateFunc) {
+      const newInstance = parser.updateFunc($wrap, content, oldInstance, meta)
+      return newInstance || oldInstance
+    } else {
+      if (oldInstance) {
+        this.cancel(cid, lang)
+      }
+      return parser.createFunc($wrap, content, meta)
+    }
+  }
+
+  _getSettingMsg = parser => {
+    if (!parser.settingMsg) {
+      const settings = {
+        language: parser.lang,
+        mappingLanguage: parser.mappingLang,
+        diagramVersion: parser.versionGetter?.() || "Unknown",
+        interactiveMode: parser.interactiveMode,
+        destroyWhenUpdate: parser.destroyWhenUpdate,
+        containerElement: parser.wrapElement,
+        metaConfigSchema: JSON.stringify(parser.metaConfigSchema),
+      }
+      parser.settingMsg = Object.entries(settings).map(([k, v]) => `    ${k}: ${v}`).join("\n")
+    }
+    return parser.settingMsg
+  }
+
+  _getWrap = (parser, $pre) => {
+    let $wrap = $pre.find(parser.checkSelector)
+    if ($wrap.length === 0) {
+      const wrap = typeof parser.wrapElement === "function" ? parser.wrapElement($pre) : parser.wrapElement
+      $wrap = $(wrap)
+      $pre.find(".md-diagram-panel-preview").html($wrap)
+    }
+    return $wrap
+  }
+
+  cancel = (cid, lang) => {
+    const parser = this.parsers.get(lang)
+    if (!parser) return
+    const instance = parser.instanceMap.get(cid)
+    if (!instance) return
+    parser.destroyFunc?.(instance)
+    parser.instanceMap.delete(cid)
+  }
+
+  destroyAll = () => {
+    for (const parser of this.parsers.values()) {
+      for (const instance of parser.instanceMap.values()) {
+        parser.destroyFunc?.(instance)
+      }
+      parser.instanceMap.clear()
+    }
+  }
+
+  process = () => {
+    const getLifeCycleFn = (fnName) => () => {
+      for (const parser of this.parsers.values()) {
+        if (!parser[fnName]) continue
+        parser.instanceMap.forEach((instance, cid) => {
+          const preview = this.utils.entities.querySelectorInWrite(`.md-fences[cid=${cid}] .md-diagram-panel-preview`)
+          if (preview) {
+            parser[fnName](preview, instance)
+          }
+        })
+      }
+    }
+    this.utils.exportHelper.register("third-party-diagram-parser", getLifeCycleFn("beforeExportToHTML"))
+    this.utils.exportHelper.registerNative("third-party-diagram-parser", getLifeCycleFn("beforeExportToNative"))
+  }
+
+  getHelpers = () => {
+    const DEFAULT_CSS = this.DEFAULT_CSS
+    const getFenceWidth = ($pre) => parseFloat($pre.find(".md-diagram-panel").css("width"))
+    const styleMetaConfigSchema = {
+      wrapDefaultStyle: (defaultStyleVal = {}) => ({
+        width: { type: "string", default: defaultStyleVal.width || DEFAULT_CSS.width, valueAliases: { auto: DEFAULT_CSS.width } },
+        height: { type: "string", default: defaultStyleVal.height || DEFAULT_CSS.height },
+        backgroundColor: { type: "string", default: defaultStyleVal.backgroundColor || DEFAULT_CSS.backgroundColor, aliases: ["gbc", "background-color"] },
+      }),
+    }
+    const renderStyle = {
+      base: ($pre, $wrap, content, meta) => meta ? this.utils.pick(meta, Object.keys(DEFAULT_CSS)) : {},
+      wrapDefault: (defaultStyle = {}) => {
+        return ($pre, $wrap, content, meta) => ({ ...defaultStyle, ...renderStyle.base($pre, $wrap, content, meta) })
+      },
+      wrapMeta: (metaToStyle) => {
+        return ($pre, $wrap, content, meta) => ({ ...metaToStyle(meta), ...renderStyle.base($pre, $wrap, content, meta) })
+      },
+    }
+    const exportStyle = {
+      svg: (lang) => {
+        const selector = this.parsers.get(lang)?.checkSelector
+        return selector
+          ? `@media print {
+              .md-diagram-panel[lang="${lang}"] { page-break-inside: avoid !important; break-inside: avoid !important; display: flex !important; justify-content: center !important; width: 100% !important; }
+              .md-diagram-panel[lang="${lang}"] ${selector} { max-width: 100% !important; width: max-content !important; overflow: visible !important; }
+              .md-diagram-panel[lang="${lang}"] svg { max-width: 100% !important; width: max-content !important; height: auto !important; }
+            }`
+          : ""
+      },
+    }
+    return { DEFAULT_CSS, styleMetaConfigSchema, renderStyle, exportStyle, getFenceWidth }
+  }
+}
+
+const DEFAULT_CASTERS = {
+  string: String,
+  number: (v) => Number.isNaN(Number(v)) ? v : Number(v),
+  boolean: (v) => v.toLowerCase() !== "false" && v !== "0",
+}
+
+function getLiteralFallback(type) {
+  if (type === "array") return []
+  if (type === "number") return 0
+  if (type === "boolean") return false
+  return ""
+}
+
+function normalizeRule(def) {
+  const rule = typeof def === "string" ? { type: def } : { ...def }
+  const hasDefault = Object.hasOwn(rule, "default")
+  const compiled = {
+    type: rule.type || "string",
+    items: rule.items || "string",
+    required: hasDefault ? false : (rule.required ?? false),
+    enum: Array.isArray(rule.enum) ? rule.enum : null,
+    aliases: Array.isArray(rule.aliases) ? rule.aliases : null,
+    valueAliases: (rule.valueAliases && typeof rule.valueAliases === "object") ? rule.valueAliases : null,
+    pattern: rule.pattern instanceof RegExp ? rule.pattern : null,
+    minItems: typeof rule.minItems === "number" ? Math.max(0, Math.floor(rule.minItems)) : null,
+    maxItems: typeof rule.maxItems === "number" ? Math.max(0, Math.floor(rule.maxItems)) : null,
+    transform: typeof rule.transform === "function" ? rule.transform : null,
+    validator: typeof rule.validator === "function" ? rule.validator : null,
+  }
+  if (hasDefault) compiled.default = rule.default
+  return compiled
+}
+
+function coerceUnknownValue(value) {
+  if (Array.isArray(value)) return value.map(coerceUnknownValue)
+  if (typeof value !== "string") return value
+  const v = value.trim()
+  if (v === "undefined") return undefined
+  if (v === "null") return null
+  if (v === "true") return true
+  if (v === "false") return false
+  if (v !== "" && !Number.isNaN(Number(v))) return Number(v)
+  return value
+}
+
+function defaultMetaExtractor(code) {
+  const BLOCK_REGEX = /^(?:\u00EF\u00BB\u00BF)?\s*\/\/\s+==BlockCodeConfig==([\s\S]*?)^\/\/\s+==\/BlockCodeConfig==[ \t]*(?:\r?\n)?/im
+  const KV_REGEX = /^\s*\/\/\s+@([a-zA-Z0-9_\-$]+)(?:\s+(.*))?$/gm
+
+  const rawData = Object.create(null)
+  let cleanContent = code || ""
+
+  const match = code?.match(BLOCK_REGEX)
+  if (match) {
+    cleanContent = code.replace(match[0], "")
+    const blockText = match[1] || ""
+    for (const [, rawKey, rawVal] of blockText.matchAll(KV_REGEX)) {
+      const val = (rawVal || "").trim()
+      if (val === "") continue
+      if (!rawData[rawKey]) rawData[rawKey] = []
+      rawData[rawKey].push(val)
+    }
+  }
+  return { rawData, cleanContent }
+}
+
+function metaConfigParserFactory(customCasters = {}) {
+  const mergedCasters = { ...DEFAULT_CASTERS, ...customCasters }
+  return function createConfigParser(schema = {}, customExtractor = null) {
+    const extractor = customExtractor || defaultMetaExtractor
+    const compiledSchema = Object.create(null)
+    const keyAliases = Object.create(null)
+    for (const [key, def] of Object.entries(schema)) {
+      const rule = normalizeRule(def)
+      compiledSchema[key] = rule
+      if (rule.aliases) {
+        for (const alias of rule.aliases) {
+          keyAliases[alias] = key
+        }
+      }
+    }
+
+    return function parse(code) {
+      const { rawData = {}, cleanContent = code } = extractor(code) || {}
+      const normalizedRawData = Object.create(null)
+      for (const [rawKey, rawValues] of Object.entries(rawData)) {
+        const canonicalKey = keyAliases[rawKey] || rawKey
+        if (!normalizedRawData[canonicalKey]) normalizedRawData[canonicalKey] = []
+        normalizedRawData[canonicalKey].push(...rawValues)
+      }
+
+      const meta = {}
+      const errors = []
+      for (const [key, rule] of Object.entries(compiledSchema)) {
+        const rawValues = normalizedRawData[key] || []
+        const isArray = rule.type === "array"
+        const itemType = isArray ? rule.items : rule.type
+        const castFn = mergedCasters[itemType] || mergedCasters.string
+
+        let processedValues = rawValues.map(v => (rule.valueAliases && Object.hasOwn(rule.valueAliases, v)) ? rule.valueAliases[v] : v).map(castFn)
+        if (rule.transform) {
+          processedValues = processedValues.flatMap(v => rule.transform(v))
+        }
+
+        const validValues = []
+        for (const v of processedValues) {
+          let isValid = true
+          if (rule.pattern && !rule.pattern.test(String(v))) {
+            errors.push(`[Pattern Error] @${key}: "${v}" does not match pattern ${rule.pattern}`)
+            isValid = false
+          } else if (rule.enum && !rule.enum.includes(v)) {
+            errors.push(`[Enum Error] @${key}: "${v}" is not in allowed list [${rule.enum.join(", ")}]`)
+            isValid = false
+          } else if (rule.validator && !rule.validator(v)) {
+            errors.push(`[Validation Error] @${key}: "${v}" failed custom validator`)
+            isValid = false
+          }
+          if (isValid) {
+            validValues.push(v)
+          }
+        }
+
+        if (isArray && rawValues.length > 0) {
+          const count = validValues.length
+          if (rule.maxItems !== null && count > rule.maxItems) {
+            errors.push(`[Collection Error] @${key}: Exceeds maximum of ${rule.maxItems} valid items (found ${count})`)
+            validValues.length = 0
+          } else if (rule.minItems !== null && count < rule.minItems) {
+            errors.push(`[Collection Error] @${key}: Requires at least ${rule.minItems} valid items (found ${count})`)
+            validValues.length = 0
+          }
+        }
+
+        if (validValues.length > 0) {
+          meta[key] = isArray ? validValues : validValues.at(-1)
+        } else {
+          if (Object.hasOwn(rule, "default")) {
+            meta[key] = Array.isArray(rule.default) ? [...rule.default] : rule.default
+          } else {
+            meta[key] = getLiteralFallback(rule.type)
+            if (rule.required && rawValues.length === 0) {
+              errors.push(`[Missing Required] @${key}: Field is required`)
+            }
+          }
+        }
+      }
+
+      // Handle undefined header keys
+      for (const [key, rawValues] of Object.entries(normalizedRawData)) {
+        if (Object.hasOwn(compiledSchema, key)) continue
+        const raw = rawValues.length === 1 ? rawValues[0] : rawValues
+        meta[key] = coerceUnknownValue(raw)
+      }
+
+      if (errors.length > 0) {
+        throw new Error("Meta Config Validation Failed:\n- " + [...new Set(errors)].join("\n- "))
+      }
+      return { meta, content: cleanContent }
+    }
+  }
+}
+
+module.exports = ThirdPartyDiagramParser
