@@ -2,6 +2,9 @@
 
 本仓库 = [obgnail/typora_plugin](https://github.com/obgnail/typora_plugin)（MIT，已署名）＋ 自研插件 **image_rename**，打包为可直接安装的一体化版本。
 
+## 适用版本
+typora version 0.9.98（beta）
+
 ## image_rename 是什么
 
 Typora 图片自定义重命名插件：粘贴 / 拖入本地图片时，按模板自动重命名磁盘文件，并同步更新 Markdown 链接与图片别名（alt），不断链。命名模板与冲突策略对齐 Obsidian 的 Image Converter 插件。详见 [`plugin/image_rename/README.md`](plugin/image_rename/README.md)。
@@ -35,3 +38,8 @@ Typora 图片自定义重命名插件：粘贴 / 拖入本地图片时，按模�
 
 - 框架部分：遵循 obgnail/typora_plugin 的 MIT 许可（Copyright (c) 2023 obgnail）。
 - image_rename 插件：© 本仓库作者，沿用 MIT。
+
+## 结语
+---
+**本项目遵循 MIT 协议，请自由地享受。**
+若本工具集对您的生产力有实质性提升，欢迎在 GitHub 点亮 Star ⭐ 支持，并将其分享给具有同等需求的朋友。
